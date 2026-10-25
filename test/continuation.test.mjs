@@ -4,8 +4,8 @@ import { Context } from '@deepseek-ai/cordis';
 import { createResponsesAuto } from '../src/engine.mjs';
 import { apply, inject } from '../src/index.mjs';
 
-const url = 'https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1/responses';
-const model = 'deepseek-v4.1-flash-1017';
+const url = 'https://gateway.example/v1/responses';
+const model = 'arbitrary-vision-model';
 const meta = { provider: 'fixture', model, sessionId: 'session-a' };
 const user = text => ({ role: 'user', content: [{ type: 'input_text', text }] });
 const assistant = text => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
@@ -34,7 +34,6 @@ test('full initial request, multi-image delta, tool round and zero probe calls',
     ? [{ type: 'function_call', call_id: 'call-1', name: 'read', arguments: '{"path":"example.txt"}' }] : undefined)));
   const a = await f.call(base(initial));
   assert.equal(f.calls[0].body.store, true);
-  assert.equal(f.calls[0].headers.get('x-dashscope-session-cache'), 'enable');
   const history = [...initial, ...a.output, user('Compare them')];
   const b = await f.call(base(history));
   assert.equal(f.calls[1].body.previous_response_id, 'r1');
@@ -56,14 +55,13 @@ test('history changes, compaction, accounts, sessions and parameters cannot shar
     [base(history), { ...meta, sessionId: 'branch' }, {}],
     [base(history), meta, { authorization: 'Bearer fixture-b' }],
     [{ ...base(history), reasoning: { effort: 'high' } }, meta, {}],
-    [{ ...base(history), model: 'qwen3.8-flash' }, { ...meta, model: 'qwen3.8-flash' }, {}],
+    [{ ...base(history), model: 'another-model' }, { ...meta, model: 'another-model' }, {}],
   ]) { await f.call(body, scope, headers); assert.equal(f.calls.at(-1).body.previous_response_id, undefined); }
 });
 
-test('unknown endpoints, no session and ZDR are exact pass-through, including Request objects', async () => {
+test('no session and ZDR are exact pass-through, including Request objects', async () => {
   const f = await fixture();
   for (const [address, scope, headers] of [
-    ['https://unverified.example/v1/responses', meta, {}],
     [url, { ...meta, sessionId: undefined }, {}],
     [url, meta, { 'x-cmd-zdr': '1' }],
   ]) {
@@ -72,7 +70,45 @@ test('unknown endpoints, no session and ZDR are exact pass-through, including Re
     await (await f.engine.fetchFor(scope)(req)).json();
     assert.deepEqual(f.calls.at(-1).body, body);
   }
-  assert.equal(f.calls.length, 3);
+  assert.equal(f.calls.length, 2);
+});
+
+test('new endpoints and model names use ordinary storage receipts without a provider allowlist', async () => {
+  const f = await fixture();
+  for (const [address, id] of [['https://new.example/custom/responses', 'new-model'], ['http://127.0.0.1:7777/v1/responses', 'local-model']]) {
+    const scope = { ...meta, model: id }, one = { ...base(initial), model: id };
+    const a = await f.call(one, scope, {}, address);
+    await f.call({ ...one, input: [...initial, ...a.output, user('Next')] }, scope, {}, address);
+    assert.equal(f.calls.at(-1).body.previous_response_id, a.id);
+    assert.deepEqual(f.calls.at(-1).body.input, [user('Next')]);
+  }
+  assert.equal(f.calls.length, 4);
+});
+
+test('ID alone, omitted storage and explicitly disabled storage never authorize context omission', async () => {
+  for (const storage of [false, undefined]) {
+    const f = await fixture(() => json(response('opaque-id', undefined, { store: storage })));
+    const a = await f.call(base(initial));
+    const history = [...initial, ...a.output, user('Next')];
+    await f.call(base(history));
+    assert.equal(f.calls.length, 2);
+    assert.deepEqual(f.calls[1].body, base(history));
+  }
+});
+
+test('storage rejection restores the original string input and all generation controls', async () => {
+  const f = await fixture(body => body.store ? new Response(JSON.stringify({ error: { message: 'store is not supported' } }), { status: 400 }) : json(response('plain')));
+  const body = { ...base('A string input'), max_output_tokens: 12345, instructions: 'Preserve this instruction' };
+  await f.call(body);
+  assert.deepEqual(f.calls[1].body, body);
+});
+
+test('changing an assistant message phase sends the complete local history', async () => {
+  const f = await fixture(() => json(response('phase-id', [{ ...assistant('OK'), phase: 'final_answer' }])));
+  const a = await f.call(base(initial));
+  await f.call(base([...initial, { ...a.output[0], phase: 'commentary' }, user('Next')]));
+  assert.equal(f.calls[1].body.previous_response_id, undefined);
+  assert.equal(f.calls[1].body.input.length, initial.length + 2);
 });
 
 test('CMD uses its own policy without Bailian headers or optional cache key', async () => {
