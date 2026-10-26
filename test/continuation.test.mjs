@@ -117,6 +117,17 @@ test('one unconfirmed response leaves other sessions confirmed chains usable', a
   assert.equal(f.calls[2].body.previous_response_id, 'r1');
 });
 
+test('an unstored text-only request in the same session cannot disable an established image chain', async () => {
+  const f = await fixture((_body, n) => sse(response('r' + n, undefined, n === 2 ? { store: false } : {})));
+  const headers = { session_id: meta.sessionId, 'x-client-request-id': meta.sessionId };
+  await f.call({ ...base(initial), stream: true }, meta, headers);
+  await f.call({ ...base([user('Summarize this text')]), max_output_tokens: 128, stream: true }, meta, headers);
+  await f.call({ ...base([...initial, assistant('OK'), user('Recall the images')]), stream: true }, meta, headers);
+  assert.equal(f.calls[2].body.previous_response_id, 'r1');
+  assert.deepEqual(f.calls[2].body.input, [user('Recall the images')]);
+  assert.equal(f.calls.length, 3); assert.equal(f.engine.inspect().probeRequests, 0);
+});
+
 test('storage rejection restores the original string input and all generation controls', async () => {
   const f = await fixture(body => body.store ? new Response(JSON.stringify({ error: { message: 'store is not supported' } }), { status: 400 }) : json(response('plain')));
   const body = { ...base('A string input'), max_output_tokens: 12345, instructions: 'Preserve this instruction' };
