@@ -92,8 +92,29 @@ test('ID alone, omitted storage and explicitly disabled storage never authorize 
     const history = [...initial, ...a.output, user('Next')];
     await f.call(base(history));
     assert.equal(f.calls.length, 2);
-    assert.deepEqual(f.calls[1].body, base(history));
+    assert.deepEqual(f.calls[1].body, { ...base(history), store: true });
   }
+});
+
+test('an unconfirmed receipt does not prevent later ordinary requests from establishing a chain', async () => {
+  for (const unconfirmed of [{ store: false }, { store: undefined }, { id: '' }, { output: undefined }]) {
+    const f = await fixture((_body, n) => json(response('r' + n, undefined, n === 1 ? unconfirmed : {})));
+    await f.call(base(initial));
+    const history = [...initial, assistant('OK'), user('Next')];
+    const b = await f.call(base(history));
+    assert.deepEqual(f.calls[1].body, { ...base(history), store: true });
+    await f.call(base([...history, ...b.output, user('Continue')]));
+    assert.equal(f.calls[2].body.previous_response_id, 'r2');
+    assert.equal(f.calls.length, 3); assert.equal(f.engine.inspect().probeRequests, 0);
+  }
+});
+
+test('one unconfirmed response leaves other sessions confirmed chains usable', async () => {
+  const f = await fixture((_body, n) => json(response('r' + n, undefined, n === 2 ? { store: false } : {})));
+  const a = await f.call(base(initial));
+  await f.call(base(initial), { ...meta, sessionId: 'session-b' });
+  await f.call(base([...initial, ...a.output, user('Continue a')]));
+  assert.equal(f.calls[2].body.previous_response_id, 'r1');
 });
 
 test('storage rejection restores the original string input and all generation controls', async () => {
@@ -124,14 +145,18 @@ test('CMD uses its own policy without Bailian headers or optional cache key', as
   }
 });
 
-test('explicit invalid ID is retried once with complete history and then remembered', async () => {
-  const f = await fixture((body, n) => body.previous_response_id
+test('explicit invalid ID falls back once, then a normal request can establish a fresh chain', async () => {
+  const f = await fixture((body, n) => n === 2 && body.previous_response_id
     ? new Response(JSON.stringify({ error: { message: 'previous_response_id not found', code: 'invalid_request_error' } }), { status: 400 })
     : json(response('r' + n)));
   const a = await f.call(base(initial)), history = [...initial, ...a.output, user('Continue')];
   await f.call(base(history));
   assert.equal(f.calls.length, 3); assert.deepEqual(f.calls[2].body, base(history));
-  await f.call(base(history)); assert.equal(f.calls.length, 4); assert.equal(f.calls[3].body.store, false);
+  const fresh = await f.call(base(history));
+  assert.equal(f.calls.length, 4);
+  assert.deepEqual(f.calls[3].body, { ...base(history), store: true });
+  await f.call(base([...history, ...fresh.output, user('Continue fresh')]));
+  assert.equal(f.calls.length, 5); assert.equal(f.calls[4].body.previous_response_id, 'r4');
 });
 
 test('unsupported store is reverted; unrelated provider errors are not retried', async () => {
