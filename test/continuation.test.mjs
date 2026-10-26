@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import { createResponsesAuto } from '../src/engine.mjs';
 import { apply, inject } from '../src/index.mjs';
+import { acquireShared } from '../src/shared.mjs';
 
 const url = 'https://gateway.example/v1/responses';
 const model = 'arbitrary-vision-model';
@@ -128,6 +129,41 @@ test('an unstored text-only request in the same session cannot disable an establ
   assert.equal(f.calls.length, 3); assert.equal(f.engine.inspect().probeRequests, 0);
 });
 
+test('background histories with identical generation parameters preserve the main continuation', async () => {
+  const f = await fixture((_body, n) => json(response('r' + n, undefined, n === 2 ? { store: false } : {})));
+  const a = await f.call(base(initial));
+  await f.call(base([user('Summarize unrelated background text')]));
+  await f.call(base([...initial, ...a.output, user('Continue the main history')]));
+  assert.equal(f.calls[2].body.previous_response_id, 'r1');
+});
+
+test('a pending background request cannot reserve the main chain or replace it on late completion', async () => {
+  let release;
+  const f = await fixture((_body, n) => n === 2
+    ? new Promise(resolve => { release = () => resolve(json(response('background'))); })
+    : json(response('r' + n)));
+  const a = await f.call(base(initial));
+  const background = f.call(base([user('Unrelated background history')]));
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  const history = [...initial, ...a.output, user('Continue main')];
+  const b = await f.call(base(history));
+  assert.equal(f.calls[2].body.previous_response_id, 'r1');
+  release(); await background;
+  await f.call(base([...history, ...b.output, user('Continue main again')]));
+  assert.equal(f.calls[3].body.previous_response_id, 'r3');
+});
+
+test('an explicit storage rejection for text requests cannot disable image storage', async () => {
+  const f = await fixture((body, n) => n === 1
+    ? new Response(JSON.stringify({ error: { message: 'store is unsupported for this request' } }), { status: 400 })
+    : json(response('r' + n)));
+  await f.call(base([user('Text only')]));
+  const a = await f.call(base(initial));
+  assert.equal(f.calls[2].body.store, true);
+  await f.call(base([...initial, ...a.output, user('Continue images')]));
+  assert.equal(f.calls[3].body.previous_response_id, 'r3');
+});
+
 test('storage rejection restores the original string input and all generation controls', async () => {
   const f = await fixture(body => body.store ? new Response(JSON.stringify({ error: { message: 'store is not supported' } }), { status: 400 }) : json(response('plain')));
   const body = { ...base('A string input'), max_output_tokens: 12345, instructions: 'Preserve this instruction' };
@@ -143,6 +179,14 @@ test('changing an assistant message phase sends the complete local history', asy
   assert.equal(f.calls[1].body.input.length, initial.length + 2);
 });
 
+test('changing a tool namespace cannot reuse the original tool history', async () => {
+  const call = { type: 'function_call', call_id: 'call-1', name: 'read', namespace: 'files', arguments: '{}' };
+  const f = await fixture(() => json(response('tool-id', [call])));
+  await f.call(base(initial));
+  await f.call(base([...initial, { ...call, namespace: 'network' }, { type: 'function_call_output', call_id: 'call-1', output: 'result' }]));
+  assert.equal(f.calls[1].body.previous_response_id, undefined);
+});
+
 test('CMD uses its own policy without Bailian headers or optional cache key', async () => {
   const f = await fixture();
   const cmd = { provider: 'cmd', model: 'deepseek/deepseek-v4.1-flash', sessionId: 'cmd-session' };
@@ -156,18 +200,16 @@ test('CMD uses its own policy without Bailian headers or optional cache key', as
   }
 });
 
-test('explicit invalid ID falls back once, then a normal request can establish a fresh chain', async () => {
+test('explicit invalid ID falls back once and establishes the replacement chain in that same request', async () => {
   const f = await fixture((body, n) => n === 2 && body.previous_response_id
     ? new Response(JSON.stringify({ error: { message: 'previous_response_id not found', code: 'invalid_request_error' } }), { status: 400 })
     : json(response('r' + n)));
   const a = await f.call(base(initial)), history = [...initial, ...a.output, user('Continue')];
-  await f.call(base(history));
-  assert.equal(f.calls.length, 3); assert.deepEqual(f.calls[2].body, base(history));
   const fresh = await f.call(base(history));
-  assert.equal(f.calls.length, 4);
-  assert.deepEqual(f.calls[3].body, { ...base(history), store: true });
+  assert.equal(f.calls.length, 3);
+  assert.deepEqual(f.calls[2].body, { ...base(history), store: true });
   await f.call(base([...history, ...fresh.output, user('Continue fresh')]));
-  assert.equal(f.calls.length, 5); assert.equal(f.calls[4].body.previous_response_id, 'r4');
+  assert.equal(f.calls.length, 4); assert.equal(f.calls[3].body.previous_response_id, 'r3');
 });
 
 test('unsupported store is reverted; unrelated provider errors are not retried', async () => {
@@ -191,7 +233,7 @@ test('partial streams do not advance continuation and keep their original output
   await f.call(base(history)); assert.equal(f.calls[2].body.previous_response_id, undefined);
 });
 
-test('concurrent branches only commit the newest completed full-history request', async () => {
+test('concurrent branches reserve an ID once and retain matching completed histories', async () => {
   let release;
   const f = await fixture((body, n) => n === 2 ? new Promise(resolve => { release = () => resolve(json(response('old'))); }) : json(response('r' + n)));
   const a = await f.call(base(initial)); const history = [...initial, ...a.output];
@@ -202,6 +244,24 @@ test('concurrent branches only commit the newest completed full-history request'
   release(); await first;
   await f.call(base([...history, user('branch-b'), ...b.output, user('Continue b')]));
   assert.equal(f.calls.at(-1).body.previous_response_id, 'r3');
+  await f.call(base([...history, user('branch-a'), assistant('OK'), user('Continue a')]));
+  assert.equal(f.calls.at(-1).body.previous_response_id, 'old');
+});
+
+test('a newer runtime replaces an older shared owner and survives until the last owner leaves', async t => {
+  const ctx = new Context(), events = [];
+  ctx.reflect.provide('llm', {}); t.after(() => ctx.fiber.dispose());
+  const owner = revision => ({ name: 'owner-' + revision, inject, apply: child => acquireShared(child, 'upgrade-test', {
+    name: 'runtime-' + revision, runtimeRevision: revision,
+    apply: runtime => runtime.effect(() => { events.push('start-' + revision); return () => events.push('stop-' + revision); }),
+  }) });
+  const first = ctx.plugin(owner(1)); await first;
+  const state = [...ctx.root[Symbol.for('dsh-response-id-reuse.upgrade-test.v1')].values()][0];
+  delete state.runtimeRevision; delete state.fiberRevision; // legacy owner state
+  const second = ctx.plugin(owner(2)); await second;
+  assert.deepEqual(events, ['start-1', 'stop-1', 'start-2']);
+  await second.dispose(); assert.deepEqual(events, ['start-1', 'stop-1', 'start-2']);
+  await first.dispose(); assert.deepEqual(events, ['start-1', 'stop-1', 'start-2', 'stop-2']);
 });
 
 test('actual Cordis middleware: shared owners, request scoping and uninstall restoration', async t => {
