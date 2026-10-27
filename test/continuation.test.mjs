@@ -368,13 +368,15 @@ test('unavailable or mismatched readback cannot authorize reasoning removal', as
 });
 
 test('native reasoning metadata is scoped to the actual model, API and successful assistant', () => {
-  const message = { role: 'assistant', content: [{ type: 'reasoning', text: 'Analysis' }, { type: 'text', text: 'OK' }], source: { replayState: {
-    response: { api: 'openai-responses', provider: meta.provider, model, responseId: 'r1', stopReason: 'stop' },
+  const message = { role: 'assistant', content: [{ type: 'reasoning', text: 'Analysis' }, { type: 'text', text: 'OK' }], source: { provider: meta.provider, model, replayState: {
+    response: { kind: 'pi-ai', version: 2, api: 'openai-responses', provider: meta.provider, model, responseId: 'r1', stopReason: 'stop' },
     blocks: [{ type: 'reasoning', thinkingSignature: JSON.stringify(thought) }, { type: 'text' }],
   } } };
   assert.deepEqual(nativeReplayHistory({ ...meta, messages: [message] }), nativeScope.replayHistory);
   assert.deepEqual(nativeReplayHistory({ ...meta, model: 'other', messages: [message] }).ids, []);
   assert.deepEqual(nativeReplayHistory({ ...meta, messages: [{ ...message, role: 'user' }] }).ids, []);
+  assert.deepEqual(nativeReplayHistory({ ...meta, messages: [{ ...message, content: [] }] }).ids, []);
+  assert.deepEqual(nativeReplayHistory({ ...meta, messages: null }).ids, []);
 });
 
 test('transport failures preserve the last confirmed response for an unchanged retry', async () => {
