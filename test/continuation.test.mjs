@@ -4,6 +4,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { createResponsesAuto } from '../src/engine.mjs';
 import { apply, inject } from '../src/index.mjs';
 import { acquireShared } from '../src/shared.mjs';
+import { nativeReplayHistory } from '../src/replay.mjs';
 
 const url = 'https://gateway.example/v1/responses';
 const model = 'arbitrary-vision-model';
@@ -15,19 +16,33 @@ const base = input => ({ model, input, store: false, stream: false, prompt_cache
 const response = (id, output = [assistant('OK')], extra = {}) => ({ id, status: 'completed', store: true, output, ...extra });
 const json = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
 const sse = value => new Response(`data: ${JSON.stringify({ type: 'response.completed', response: value })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
-async function fixture(handler) {
-  const calls = [];
+async function fixture(handler, readback = value => value) {
+  const calls = [], reads = [], stored = new Map();
   const send = async (input, init) => {
-    const r = new Request(input, init), body = JSON.parse(await r.text());
+    const r = new Request(input, init);
+    if (r.method === 'GET') {
+      reads.push(r);
+      const value = stored.get(decodeURIComponent(new URL(r.url).pathname.split('/').at(-1)));
+      return value ? readback(structuredClone(value), r) : Response.json({}, { status: 404 });
+    }
+    const body = JSON.parse(await r.text());
     calls.push({ url: r.url, body, headers: r.headers });
-    return handler ? handler(body, calls.length, r) : json(response('r' + calls.length));
+    const result = handler ? await handler(body, calls.length, r) : json(response('r' + calls.length));
+    const content = await result.clone().text();
+    try {
+      const value = result.headers.get('content-type')?.includes('text/event-stream')
+        ? content.split('\n').filter(line => line.startsWith('data:')).map(line => JSON.parse(line.slice(5))).find(e => e.type === 'response.completed')?.response
+        : JSON.parse(content);
+      if (value?.id) stored.set(value.id, value);
+    } catch {}
+    return result;
   };
   const engine = await createResponsesAuto({ fetchImpl: send });
   const call = async (body, scope = meta, headers = {}, address = url) => {
     const result = await engine.fetchFor(scope)(address, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer fixture-a', ...headers }, body: JSON.stringify(body) });
     return result.headers.get('content-type')?.includes('text/event-stream') ? result.text() : result.json();
   };
-  return { engine, calls, call, send };
+  return { engine, calls, reads, call, send };
 }
 
 test('full initial request, multi-image delta, tool round and zero probe calls', async () => {
@@ -280,27 +295,86 @@ test('partial streams retain the confirmed parent without adopting partial outpu
   await f.call(base(history)); assert.equal(f.calls[2].body.previous_response_id, 'r1');
 });
 
-test('reasoning history uses identical full native requests across providers, retries and background work', async () => {
-  for (const address of [url, 'https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1/responses', 'https://api.commandcode.ai/provider/v1/responses']) {
+test('reasoning storage is read back automatically while native and opaque replay stay intact', async () => {
+  for (const address of [url, 'https://other.example/v2/responses']) {
     for (const thought of [
-      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'Keep this analysis.' }] },
-      { type: 'reasoning', summary: [], encrypted_content: 'opaque-native-reasoning' },
-      { ...assistant('Checked'), reasoning_content: 'Keep this analysis.' },
+      { id: 'thinking-1', type: 'reasoning', summary: [{ type: 'summary_text', text: 'Keep this analysis.' }] },
+      { id: 'thinking-1', type: 'reasoning', summary: [], encrypted_content: 'opaque-native-reasoning' },
     ]) {
       const f = await fixture((_body, n) => json(response('r' + n, [thought, assistant('OK')])));
       const first = await f.call(base(initial), meta, {}, address);
       const history = [...initial, ...first.output, user('Next')];
-      for (const body of [base(history), base(history), { ...base(history), max_output_tokens: 512 },
-        base([history[0], user('Original image offloaded; reference preserved'), ...history.slice(2)])]) {
-        await f.call(body, meta, {}, address);
-        assert.deepEqual(f.calls.at(-1).body, body);
-        assert.equal(f.calls.at(-1).headers.get('x-dashscope-session-cache'), null);
-      }
-      assert.equal(f.engine.inspect().last.reason, 'reasoning-history-requires-full-replay');
+      await f.call(base(history), { ...meta, replayHistory: { ids: [thought.id] } }, {}, address);
+      assert.equal(f.calls[1].body.previous_response_id, first.id);
+      assert.deepEqual(f.calls[1].body.input, [user('Next')]);
+      const edited = [user('Edited prefix'), ...history.slice(1)];
+      await f.call(base(edited), { ...meta, replayHistory: { ids: [thought.id] } }, {}, address);
+      assert.deepEqual(f.calls.at(-1).body.input, edited);
       assert.equal(f.engine.inspect().probeRequests, 0);
       await f.engine.close();
     }
   }
+});
+
+const thought = { id: 'thinking-1', type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: 'Synthetic earlier analysis.' }] };
+const omittedThoughts = value => json({ ...value, output: value.output.filter(item => item.type !== 'reasoning') });
+const nativeScope = { ...meta, replayHistory: { ids: [thought.id], sample: { id: 'r1', reasoningIds: [thought.id] } } };
+
+test('stored-history projection keeps continuation, invalid-ID fallback and background snapshots equivalent', async () => {
+  const f = await fixture((body, n) => n === 4 && body.previous_response_id
+    ? Response.json({ error: { message: 'previous_response_id not found' } }, { status: 400 })
+    : sse(response('r' + n, n === 1 ? [thought, assistant('OK')] : [assistant('Done')])) , omittedThoughts);
+  const original = structuredClone(initial);
+  await f.call({ ...base(initial), stream: true });
+  const mainInput = [...initial, thought, assistant('OK'), user('Next')];
+  await f.call(base(mainInput), nativeScope);
+  // The snapshot predates the latest answer, so it needs the still-valid parent.
+  await f.call(base([...mainInput, user('Prepare this snapshot')]), nativeScope);
+  assert.equal(f.calls[1].body.previous_response_id, 'r1');
+  assert.equal(f.calls[2].body.previous_response_id, 'r1');
+  await f.call(base([...mainInput, user('Try another branch')]), nativeScope);
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.calls[4].body.previous_response_id, undefined);
+  assert.deepEqual(f.calls[4].body.input, [...mainInput.filter(item => item !== thought), user('Try another branch')]);
+  assert.deepEqual(initial, original);
+  assert.equal(f.reads.length, 1);
+  assert.equal(f.engine.inspect().probeRequests, 0);
+});
+
+test('cold resume and changed image history use stored representation without deleting unknown or encrypted reasoning', async () => {
+  const f = await fixture((_body, n) => json(response('r' + n, [thought, assistant('OK')])), omittedThoughts);
+  await f.call(base(initial)); await f.engine.close();
+  const fresh = await createResponsesAuto({ fetchImpl: f.send });
+  const unknown = { ...thought, id: 'not-native-history' };
+  const encrypted = { id: 'opaque', type: 'reasoning', summary: [], encrypted_content: 'signed-state' };
+  const input = [user('Image offloaded; original reference retained'), thought, unknown, encrypted, assistant('OK'), user('Continue')];
+  const body = base(input), before = structuredClone(body);
+  await (await fresh.fetchFor(nativeScope)(url, { method: 'POST', headers: { authorization: 'Bearer fixture-a', 'content-length': String(Buffer.byteLength(JSON.stringify(body))) }, body: JSON.stringify(body) })).text();
+  assert.deepEqual(f.calls.at(-1).body.input, input.filter(item => item !== thought));
+  assert.equal(f.calls.at(-1).headers.get('content-length'), null);
+  assert.deepEqual(body, before);
+  await fresh.close();
+});
+
+test('unavailable or mismatched readback cannot authorize reasoning removal', async () => {
+  for (const readback of [() => Response.json({}, { status: 404 }), value => json({ ...value, id: 'wrong-response', output: [assistant('OK')] })]) {
+    const f = await fixture((_body, n) => json(response('r' + n, [thought, assistant('OK')])), readback);
+    await f.call(base(initial));
+    const input = [user('Changed'), ...initial.slice(1), thought, assistant('OK'), user('Next')];
+    await f.call(base(input), nativeScope);
+    assert.deepEqual(f.calls.at(-1).body.input, input);
+    assert.equal(f.reads.length, 1);
+  }
+});
+
+test('native reasoning metadata is scoped to the actual model, API and successful assistant', () => {
+  const message = { role: 'assistant', content: [{ type: 'reasoning', text: 'Analysis' }, { type: 'text', text: 'OK' }], source: { replayState: {
+    response: { api: 'openai-responses', provider: meta.provider, model, responseId: 'r1', stopReason: 'stop' },
+    blocks: [{ type: 'reasoning', thinkingSignature: JSON.stringify(thought) }, { type: 'text' }],
+  } } };
+  assert.deepEqual(nativeReplayHistory({ ...meta, messages: [message] }), nativeScope.replayHistory);
+  assert.deepEqual(nativeReplayHistory({ ...meta, model: 'other', messages: [message] }).ids, []);
+  assert.deepEqual(nativeReplayHistory({ ...meta, messages: [{ ...message, role: 'user' }] }).ids, []);
 });
 
 test('transport failures preserve the last confirmed response for an unchanged retry', async () => {
