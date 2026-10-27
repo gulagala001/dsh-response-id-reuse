@@ -270,24 +270,66 @@ test('detail errors unrelated to storage rejection and failed fallbacks are not 
   }
 });
 
-test('partial streams do not advance continuation and keep their original output', async () => {
+test('partial streams retain the confirmed parent without adopting partial output', async () => {
   let turn = 0;
   const f = await fixture(() => ++turn === 1 ? sse(response('r1')) : new Response('data: {"type":"response.output_text.delta","delta":"partial"}\n\n', { headers: { 'content-type': 'text/event-stream' } }));
   await f.call({ ...base(initial), stream: true });
   const history = [...initial, assistant('OK'), user('Next')];
   const partial = await f.call({ ...base(history), stream: true });
   assert.match(partial, /partial/); assert.equal(f.calls[1].body.previous_response_id, 'r1');
-  await f.call(base(history)); assert.equal(f.calls[2].body.previous_response_id, undefined);
+  await f.call(base(history)); assert.equal(f.calls[2].body.previous_response_id, 'r1');
 });
 
-test('concurrent branches reserve an ID once and retain matching completed histories', async () => {
+test('reasoning history uses identical full native requests across providers, retries and background work', async () => {
+  for (const address of [url, 'https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1/responses', 'https://api.commandcode.ai/provider/v1/responses']) {
+    for (const thought of [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'Keep this analysis.' }] },
+      { type: 'reasoning', summary: [], encrypted_content: 'opaque-native-reasoning' },
+      { ...assistant('Checked'), reasoning_content: 'Keep this analysis.' },
+    ]) {
+      const f = await fixture((_body, n) => json(response('r' + n, [thought, assistant('OK')])));
+      const first = await f.call(base(initial), meta, {}, address);
+      const history = [...initial, ...first.output, user('Next')];
+      for (const body of [base(history), base(history), { ...base(history), max_output_tokens: 512 },
+        base([history[0], user('Original image offloaded; reference preserved'), ...history.slice(2)])]) {
+        await f.call(body, meta, {}, address);
+        assert.deepEqual(f.calls.at(-1).body, body);
+        assert.equal(f.calls.at(-1).headers.get('x-dashscope-session-cache'), null);
+      }
+      assert.equal(f.engine.inspect().last.reason, 'reasoning-history-requires-full-replay');
+      assert.equal(f.engine.inspect().probeRequests, 0);
+      await f.engine.close();
+    }
+  }
+});
+
+test('transport failures preserve the last confirmed response for an unchanged retry', async () => {
+  const f = await fixture((_body, n) => { if (n === 2) throw Error('connection lost'); return json(response('r' + n)); });
+  const a = await f.call(base(initial)), history = [...initial, ...a.output, user('Continue')];
+  await assert.rejects(f.call(base(history)), /connection lost/);
+  await f.call(base(history));
+  assert.equal(f.calls[1].body.previous_response_id, 'r1');
+  assert.deepEqual(f.calls[2].body, f.calls[1].body);
+});
+
+test('changed assistant fields cannot be mistaken for an identical history prefix', async () => {
+  const output = [{ ...assistant('OK'), name: 'original-speaker', tool_calls: [{ id: 'call-a' }] }];
+  for (const patch of [{ name: 'other-speaker' }, { tool_calls: [{ id: 'call-b' }] }]) {
+    const f = await fixture(() => json(response('r1', output)));
+    await f.call(base(initial));
+    await f.call(base([...initial, { ...output[0], ...patch }, user('Next')]));
+    assert.equal(f.calls[1].body.previous_response_id, undefined);
+  }
+});
+
+test('concurrent branches reuse their immutable parent and retain matching completed histories', async () => {
   let release;
   const f = await fixture((body, n) => n === 2 ? new Promise(resolve => { release = () => resolve(json(response('old'))); }) : json(response('r' + n)));
   const a = await f.call(base(initial)); const history = [...initial, ...a.output];
   const first = f.call(base([...history, user('branch-a')]));
   while (!release) await new Promise(resolve => setImmediate(resolve));
   const b = await f.call(base([...history, user('branch-b')]));
-  assert.equal(f.calls[2].body.previous_response_id, undefined);
+  assert.equal(f.calls[2].body.previous_response_id, 'r1');
   release(); await first;
   await f.call(base([...history, user('branch-b'), ...b.output, user('Continue b')]));
   assert.equal(f.calls.at(-1).body.previous_response_id, 'r3');
