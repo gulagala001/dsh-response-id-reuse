@@ -223,6 +223,53 @@ test('unsupported store is reverted; unrelated provider errors are not retried',
   await assert.rejects(h.call(base(initial)), /offline/); assert.equal(h.calls.length, 1);
 });
 
+test('Codex storage rejection falls back once with full history and is remembered', async () => {
+  for (const error of [
+    { detail: 'Store must be set to false' },
+    { error: { message: 'Store must be set to false' } },
+    { error: { detail: 'Store must be false' } },
+    { error: { code: 'invalid_request_error' }, detail: 'Store must be set to false' },
+  ]) {
+    for (const established of [false, true]) {
+      const f = await fixture((body, n) => established && n === 1 ? json(response('r1')) : body.store
+        ? Response.json(error, { status: 400 }) : sse(response('normal', undefined, { store: false })));
+      const scope = { ...meta, provider: 'codex' }, address = 'https://chatgpt.com/backend-api/codex/responses';
+      let history = initial;
+      if (established) {
+        const previous = await f.call({ ...base(initial), instructions: 'Keep the full context' }, scope, {}, address);
+        history = [...initial, ...previous.output, user('Continue')];
+      }
+      const body = { ...base(history), stream: true, instructions: 'Keep the full context' };
+      const result = await f.call(body, scope, {}, address);
+      assert.match(result, /response.completed/);
+      assert.equal(f.calls.length, established ? 3 : 2);
+      assert.equal(f.calls[established ? 1 : 0].body.previous_response_id, established ? 'r1' : undefined);
+      assert.deepEqual(f.calls.at(-1).body, body);
+      assert.equal(f.engine.inspect().fallbacks, 1);
+      assert.equal(f.engine.inspect().activeChains, 0);
+      await f.call(body, scope, {}, address);
+      assert.equal(f.calls.length, established ? 4 : 3);
+      assert.deepEqual(f.calls.at(-1).body, body);
+      assert.equal(f.engine.inspect().fallbacks, 1);
+      await f.engine.close();
+    }
+  }
+});
+
+test('detail errors unrelated to storage rejection and failed fallbacks are not retried again', async () => {
+  for (const [status, detail, attempts] of [
+    [400, 'Temperature is not supported', 1],
+    [400, 'Store backend temporarily unavailable', 1],
+    [429, 'Store must be set to false', 1],
+    [400, 'Store must be set to false', 2],
+  ]) {
+    const f = await fixture(() => Response.json({ detail }, { status }));
+    assert.deepEqual(await f.call(base(initial)), { detail });
+    assert.equal(f.calls.length, attempts);
+    await f.engine.close();
+  }
+});
+
 test('partial streams do not advance continuation and keep their original output', async () => {
   let turn = 0;
   const f = await fixture(() => ++turn === 1 ? sse(response('r1')) : new Response('data: {"type":"response.output_text.delta","delta":"partial"}\n\n', { headers: { 'content-type': 'text/event-stream' } }));
