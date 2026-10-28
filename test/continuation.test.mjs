@@ -16,7 +16,7 @@ const base = input => ({ model, input, store: false, stream: false, prompt_cache
 const response = (id, output = [assistant('OK')], extra = {}) => ({ id, status: 'completed', store: true, output, ...extra });
 const json = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
 const sse = value => new Response(`data: ${JSON.stringify({ type: 'response.completed', response: value })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
-async function fixture(handler, readback = value => value) {
+async function fixture(handler, readback = value => value, options = {}) {
   const calls = [], reads = [], stored = new Map();
   const send = async (input, init) => {
     const r = new Request(input, init);
@@ -37,7 +37,7 @@ async function fixture(handler, readback = value => value) {
     } catch {}
     return result;
   };
-  const engine = await createResponsesAuto({ fetchImpl: send });
+  const engine = await createResponsesAuto({ fetchImpl: send, ...options });
   const call = async (body, scope = meta, headers = {}, address = url) => {
     const result = await engine.fetchFor(scope)(address, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer fixture-a', ...headers }, body: JSON.stringify(body) });
     return result.headers.get('content-type')?.includes('text/event-stream') ? result.text() : result.json();
@@ -369,9 +369,10 @@ test('unavailable or mismatched readback cannot authorize reasoning removal', as
 
 test('server errors on continuation replay the verified history once and preserve both parent and replacement', async () => {
   for (const status of [500, 502, 503, 504]) {
+    let clock = 1000;
     const f = await fixture((_body, n) => n === 2
       ? Response.json({ error: { message: 'Synthetic upstream failure' } }, { status })
-      : sse(response('r' + n, n === 1 ? [thought, assistant('OK')] : [assistant('Done')])), omittedThoughts);
+      : sse(response('r' + n, n === 1 ? [thought, assistant('OK')] : [assistant('Done')])), omittedThoughts, { now: () => clock });
     await f.call({ ...base(initial), stream: true });
     const input = [...initial, thought, assistant('OK'), user('Next')];
     const body = { ...base(input), stream: true }, original = structuredClone(body);
@@ -384,6 +385,9 @@ test('server errors on continuation replay the verified history once and preserv
     assert.equal(f.engine.inspect().activeChains, 2);
     assert.equal(f.engine.inspect().capabilities[0].replayMode, 'omit-plain');
     await f.call(base([...input, assistant('Done'), user('Continue replacement')]), nativeScope);
+    assert.equal(f.calls.at(-1).body.previous_response_id, undefined);
+    clock += 60001;
+    await f.call(base([...input, assistant('Done'), user('Retry replacement after cooldown')]), nativeScope);
     assert.equal(f.calls.at(-1).body.previous_response_id, 'r3');
     await f.call(base([...initial, thought, assistant('OK'), user('Background branch')]), nativeScope);
     assert.equal(f.calls.at(-1).body.previous_response_id, 'r1');
@@ -406,13 +410,17 @@ test('server-error recovery preserves unverified and encrypted reasoning and all
 });
 
 test('a failed server-error fallback stops after one replay and retains its confirmed parent', async () => {
+  let clock = 1000;
   const f = await fixture((_body, n) => [2, 3].includes(n)
-    ? Response.json({ error: { message: 'Still unavailable' } }, { status: 500 }) : json(response('r' + n)));
+    ? Response.json({ error: { message: 'Still unavailable' } }, { status: 500 }) : json(response('r' + n)), value => value, { now: () => clock });
   const first = await f.call(base(initial)), body = base([...initial, ...first.output, user('Next')]);
   assert.deepEqual(await f.call(body), { error: { message: 'Still unavailable' } });
   assert.equal(f.calls.length, 3);
   assert.equal(f.engine.inspect().activeChains, 1);
   assert.equal(f.engine.inspect().capabilities[0].state, 'stored');
+  await f.call(body);
+  assert.equal(f.calls.at(-1).body.previous_response_id, undefined);
+  clock += 60001;
   await f.call(body);
   assert.equal(f.calls.at(-1).body.previous_response_id, 'r1');
 });
@@ -440,9 +448,9 @@ test('cancellation after a continuation failure does not start a full replay', a
     controller.abort(); return Response.json({}, { status: 500 });
   });
   const first = await f.call(base(initial));
-  await (await f.engine.fetchFor(meta)(url, { method: 'POST', signal: controller.signal,
+  await assert.rejects(f.engine.fetchFor(meta)(url, { method: 'POST', signal: controller.signal,
     headers: { 'content-type': 'application/json', authorization: 'Bearer fixture-a' },
-    body: JSON.stringify(base([...initial, ...first.output, user('Next')])) })).json();
+    body: JSON.stringify(base([...initial, ...first.output, user('Next')])) }), { name: 'AbortError' });
   assert.equal(f.calls.length, 2);
   assert.equal(f.engine.inspect().fallbacks, 0);
 });
