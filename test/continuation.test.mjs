@@ -367,6 +367,86 @@ test('unavailable or mismatched readback cannot authorize reasoning removal', as
   }
 });
 
+test('server errors on continuation replay the verified history once and preserve both parent and replacement', async () => {
+  for (const status of [500, 502, 503, 504]) {
+    const f = await fixture((_body, n) => n === 2
+      ? Response.json({ error: { message: 'Synthetic upstream failure' } }, { status })
+      : sse(response('r' + n, n === 1 ? [thought, assistant('OK')] : [assistant('Done')])), omittedThoughts);
+    await f.call({ ...base(initial), stream: true });
+    const input = [...initial, thought, assistant('OK'), user('Next')];
+    const body = { ...base(input), stream: true }, original = structuredClone(body);
+    assert.match(await f.call(body, nativeScope), /response.completed/);
+    assert.equal(f.calls.length, 3);
+    assert.equal(f.calls[1].body.previous_response_id, 'r1');
+    assert.deepEqual(f.calls[2].body, { ...body, input: input.filter(item => item !== thought), store: true });
+    assert.deepEqual(body, original);
+    assert.equal(f.engine.inspect().fallbacks, 1);
+    assert.equal(f.engine.inspect().activeChains, 2);
+    assert.equal(f.engine.inspect().capabilities[0].replayMode, 'omit-plain');
+    await f.call(base([...input, assistant('Done'), user('Continue replacement')]), nativeScope);
+    assert.equal(f.calls.at(-1).body.previous_response_id, 'r3');
+    await f.call(base([...initial, thought, assistant('OK'), user('Background branch')]), nativeScope);
+    assert.equal(f.calls.at(-1).body.previous_response_id, 'r1');
+    await f.engine.close();
+  }
+});
+
+test('server-error recovery preserves unverified and encrypted reasoning and all request controls', async () => {
+  const encrypted = { id: 'opaque', type: 'reasoning', summary: [], encrypted_content: 'signed-state' };
+  const f = await fixture((_body, n) => n === 2 ? Response.json({}, { status: 500 })
+    : json(response('r' + n, n === 1 ? [thought, encrypted, assistant('OK')] : undefined)), () => Response.json({}, { status: 500 }));
+  const controls = { instructions: 'Preserve instructions', max_output_tokens: 999,
+    tools: [{ type: 'function', name: 'read', parameters: { type: 'object' } }], tool_choice: 'auto', parallel_tool_calls: false };
+  const first = await f.call({ ...base(initial), ...controls });
+  const body = { ...base([...initial, ...first.output, user('Next')]), ...controls };
+  await f.call(body, nativeScope);
+  assert.equal(f.calls[1].body.previous_response_id, 'r1');
+  assert.deepEqual(f.calls[2].body, { ...body, store: true });
+  assert.equal(f.engine.inspect().capabilities[0].replayMode, undefined);
+});
+
+test('a failed server-error fallback stops after one replay and retains its confirmed parent', async () => {
+  const f = await fixture((_body, n) => [2, 3].includes(n)
+    ? Response.json({ error: { message: 'Still unavailable' } }, { status: 500 }) : json(response('r' + n)));
+  const first = await f.call(base(initial)), body = base([...initial, ...first.output, user('Next')]);
+  assert.deepEqual(await f.call(body), { error: { message: 'Still unavailable' } });
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.engine.inspect().activeChains, 1);
+  assert.equal(f.engine.inspect().capabilities[0].state, 'stored');
+  await f.call(body);
+  assert.equal(f.calls.at(-1).body.previous_response_id, 'r1');
+});
+
+test('initial server errors, unrelated client errors and caller-owned continuation are not replayed', async () => {
+  for (const [status, established] of [[500, false], [503, false], [400, true], [401, true], [403, true], [429, true]]) {
+    const f = await fixture((_body, n) => established && n === 1 ? json(response('r1')) : Response.json({}, { status }));
+    let input = initial;
+    if (established) { const first = await f.call(base(input)); input = [...input, ...first.output, user('Next')]; }
+    await f.call(base(input));
+    assert.equal(f.calls.length, established ? 2 : 1);
+    assert.equal(f.engine.inspect().fallbacks, 0);
+  }
+  const f = await fixture(() => Response.json({}, { status: 500 }));
+  const body = { ...base([user('Next')]), previous_response_id: 'caller-owned' };
+  await f.call(body);
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.calls[0].body, body);
+});
+
+test('cancellation after a continuation failure does not start a full replay', async () => {
+  const controller = new AbortController();
+  const f = await fixture((_body, n) => {
+    if (n === 1) return json(response('r1'));
+    controller.abort(); return Response.json({}, { status: 500 });
+  });
+  const first = await f.call(base(initial));
+  await (await f.engine.fetchFor(meta)(url, { method: 'POST', signal: controller.signal,
+    headers: { 'content-type': 'application/json', authorization: 'Bearer fixture-a' },
+    body: JSON.stringify(base([...initial, ...first.output, user('Next')])) })).json();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.engine.inspect().fallbacks, 0);
+});
+
 test('native reasoning metadata is scoped to the actual model, API and successful assistant', () => {
   const message = { role: 'assistant', content: [{ type: 'reasoning', text: 'Analysis' }, { type: 'text', text: 'OK' }], source: { provider: meta.provider, model, replayState: {
     response: { kind: 'pi-ai', version: 2, api: 'openai-responses', provider: meta.provider, model, responseId: 'r1', stopReason: 'stop' },
