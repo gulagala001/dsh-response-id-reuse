@@ -286,12 +286,14 @@ test('detail errors unrelated to storage rejection and failed fallbacks are not 
 });
 
 test('partial streams retain the confirmed parent without adopting partial output', async () => {
-  let turn = 0;
-  const f = await fixture(() => ++turn === 1 ? sse(response('r1')) : new Response('data: {"type":"response.output_text.delta","delta":"partial"}\n\n', { headers: { 'content-type': 'text/event-stream' } }));
+  let turn = 0, clock = 1000;
+  const f = await fixture(() => ++turn === 1 ? sse(response('r1')) : new Response('data: {"type":"response.output_text.delta","delta":"partial"}\n\n', { headers: { 'content-type': 'text/event-stream' } }), value => value, { now: () => clock });
   await f.call({ ...base(initial), stream: true });
   const history = [...initial, assistant('OK'), user('Next')];
   const partial = await f.call({ ...base(history), stream: true });
   assert.match(partial, /partial/); assert.equal(f.calls[1].body.previous_response_id, 'r1');
+  assert.equal(f.engine.inspect().continuationHealth[0].state, 'cooling');
+  clock += 60001;
   await f.call(base(history)); assert.equal(f.calls[2].body.previous_response_id, 'r1');
 });
 
@@ -468,12 +470,15 @@ test('native reasoning metadata is scoped to the actual model, API and successfu
 });
 
 test('transport failures preserve the last confirmed response for an unchanged retry', async () => {
-  const f = await fixture((_body, n) => { if (n === 2) throw Error('connection lost'); return json(response('r' + n)); });
+  let clock = 1000;
+  const f = await fixture((_body, n) => { if (n === 2) throw Error('connection lost'); return json(response('r' + n)); }, value => value, { now: () => clock });
   const a = await f.call(base(initial)), history = [...initial, ...a.output, user('Continue')];
   await assert.rejects(f.call(base(history)), /connection lost/);
   await f.call(base(history));
   assert.equal(f.calls[1].body.previous_response_id, 'r1');
-  assert.deepEqual(f.calls[2].body, f.calls[1].body);
+  assert.equal(f.calls[2].body.previous_response_id, undefined);
+  clock += 60001; await f.call(base(history));
+  assert.deepEqual(f.calls[3].body, f.calls[1].body);
 });
 
 test('changed assistant fields cannot be mistaken for an identical history prefix', async () => {

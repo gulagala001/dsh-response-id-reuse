@@ -159,3 +159,53 @@ test('a late successful continuation cannot undo a newer failure cooldown', asyn
   await (await f.send()).text();
   assert.equal(f.calls.at(-1).previous_response_id, undefined);
 });
+
+for (const terminal of ['response.failed', 'response.incomplete', 'error', 'eof', 'transport-error']) test(terminal + ' cools continuation without replaying delivered output', async t => {
+  const f = await local(t, (body, res, n) => {
+    if (!body.previous_response_id) return reply(res, 'full-' + n);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    event(res, { type: 'response.output_text.delta', delta: 'already delivered' });
+    if (terminal === 'transport-error') { const timer = setTimeout(() => res.destroy(), 10); res.on('close', () => clearTimeout(timer)); return; }
+    if (terminal !== 'eof') event(res, { type: terminal, response: { status: 'failed' } });
+    res.end();
+  });
+  const response = await f.send();
+  if (terminal === 'transport-error') await assert.rejects(response.text()); else assert.match(await response.text(), /already delivered/);
+  assert.equal(f.calls.length, 2); assert.equal(f.engine.inspect().fallbacks, 0);
+  assert.equal(f.engine.inspect().continuationHealth[0].state, 'cooling');
+  await (await f.send()).text(); assert.equal(f.calls.at(-1).previous_response_id, undefined);
+  assert.equal(f.engine.inspect().continuationHealth[0].state, 'cooling', 'full success cannot clear a continuation failure');
+});
+
+test('a failed half-open stream renews cooldown and retains the confirmed parent', async t => {
+  let clock = 1000;
+  const f = await local(t, (body, res, n) => {
+    if (n === 2) { res.writeHead(503); res.end(); return; }
+    if (!body.previous_response_id) return reply(res, 'full-' + n);
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); event(res, { type: 'response.failed', response: { status: 'failed' } }); res.end();
+  }, { now: () => clock });
+  await (await f.send()).text(); clock += 60001;
+  await (await f.send()).text();
+  assert.equal(f.calls.at(-1).previous_response_id, 'parent');
+  assert.equal(f.engine.inspect().continuationHealth[0].state, 'cooling');
+  assert.equal(f.engine.inspect().continuationHealth[0].retryAfterMs, 120000);
+});
+
+test('cancelling a consumed response body does not mark the route unhealthy', async t => {
+  const f = await local(t, (_body, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); event(res, { type: 'response.output_text.delta', delta: 'partial' });
+  });
+  const response = await f.send(); await response.body.cancel();
+  assert.equal(f.engine.inspect().continuationHealth[0].state, 'healthy');
+  assert.equal(f.engine.inspect().fallbacks, 0);
+});
+
+test('multi-line terminal events and EOF framing preserve successful continuation', async t => {
+  const f = await local(t, (_body, res, n) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(JSON.stringify(completed('multiline-' + n), null, 2).split('\n').map(line => 'data: ' + line).join('\n'));
+  });
+  await (await f.send()).text();
+  assert.equal(f.engine.inspect().continuationHealth[0].state, 'healthy');
+  assert.equal(f.engine.inspect().last.committed, true);
+});
