@@ -1,5 +1,22 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "published": "0.1.7-dsh.0.2.2-rc.1",
+  "repository": {
+    "slug": "gulagala001/dsh-response-id-reuse",
+    "description": "Transparent Responses ID continuation for DeepSeek Harness; no UI or model probes.",
+    "homepage": "",
+    "topics": [
+      "deepseek-harness",
+      "dsh-plugin",
+      "responses-api",
+      "response-id"
+    ]
+  },
+  "names": [
+    "DSH Response ID Reuse",
+    "Response ID Reuse"
+  ],
+  "maxPages": 4,
   "documents": [
     {
       "path": "README.md",
@@ -20,11 +37,6 @@
     },
     {
       "path": "CONTRIBUTING.md",
-      "role": "development",
-      "language": "bilingual"
-    },
-    {
-      "path": "docs/documentation.md",
       "role": "development",
       "language": "bilingual"
     }
