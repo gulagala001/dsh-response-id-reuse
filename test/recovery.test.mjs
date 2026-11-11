@@ -209,3 +209,22 @@ test('multi-line terminal events and EOF framing preserve successful continuatio
   assert.equal(f.engine.inspect().continuationHealth[0].state, 'healthy');
   assert.equal(f.engine.inspect().last.committed, true);
 });
+
+test('probe leases expire without allowing a late old receipt to alter the new lease',async () => {
+  const {ContinuationHealth} = await import('../src/recovery.mjs');
+  let time=0; const h=new ContinuationHealth({now:()=>time,cooldownMs:10,maxWaitMs:50});
+  const route=h.route('old',{});
+  h.fail(h.enter(route));
+  for(let i=0;i<520;i++) h.route('route-'+i,{});
+  assert.equal(h.route('old',{}),route); assert.equal(h.enter(route),null);
+  time=11;const abandoned=h.enter(route);
+  time+=51;const next=h.enter(route);assert.ok(next); assert.equal(h.enter(route),null);
+  h.fail(abandoned);h.success(abandoned);h.release(abandoned);
+  assert.equal(route.probe,next);assert.equal(h.routes.size,512);
+});
+test('a full SSE response does not supply a continuation latency sample',async t=>{
+  const f=await local(t,(_body,res)=>reply(res,'next'),{recovery:{minWaitMs:1000,defaultWaitMs:25000,maxWaitMs:60000}});
+  assert.equal(f.engine.inspect().continuationHealth[0].firstOutputBudgetMs,25000);
+  await (await f.send()).text();
+  assert.ok(f.engine.inspect().continuationHealth[0].firstOutputBudgetMs<25000);
+});

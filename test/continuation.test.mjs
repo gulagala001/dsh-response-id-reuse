@@ -552,3 +552,33 @@ test('actual Cordis middleware: shared owners, request scoping and uninstall res
   assert.equal(f.calls.at(-1).body.previous_response_id, undefined);
   await reload.dispose();
 });
+
+test('tool-bearing 5xx continuations dispatch once, then cool', async () => {
+  const tools = [{type:'web_search_preview'}];
+  const f = await fixture((body,n) => n === 2 ? new Response('unavailable',{status:503}) : json(response('r'+n)));
+  const a = await f.call({...base(initial),tools});
+  const body = {...base([...initial,...a.output,user('next')]),tools};
+  await assert.rejects(f.call(body), SyntaxError);
+  assert.equal(f.calls.length,2); assert.equal(f.engine.inspect().continuationHealth[0].state,'cooling');
+  await f.call(body); assert.equal(f.calls[2].body.previous_response_id,undefined);
+});
+test('normal output cutoff and local observation limit leave the route healthy', async () => {
+  const f = await fixture((_body,n) => json(n===2 ? response('limited',[],{status:'incomplete',incomplete_details:{reason:'max_output_tokens'}})
+    : n===3 ? response('large',[],{padding:'x'.repeat(16*1024*1024+1)}) : response('r'+n)));
+  const a = await f.call(base(initial)), body = base([...initial,...a.output,user('next')]);
+  for (let n=2; n<=4; n++) {
+    await f.call(body);
+    assert.equal(f.engine.inspect().continuationHealth[0].state,'healthy');
+    assert.equal(f.calls[n-1].body.previous_response_id,'r1');
+  }
+});
+test('inconclusive readbacks cannot extend an unsupported verdict', async () => {
+  let time = 100000;
+  const f = await fixture((_body,n) => n === 1 ? Response.json({error:{message:'store is unsupported'}},{status:400}) : json(response('r'+n)),
+    undefined, {now:() => time, capabilityTtlMs:200000});
+  await f.call(base(initial)); const before = f.engine.inspect().capabilities[0];
+  const scope = {...meta,replayHistory:{sample:{id:'missing',reasoningIds:['missing']}}};
+  for(let i=0;i<3;i++) {time+=61000;await f.call(base(initial),scope);}
+  assert.equal(f.engine.inspect().capabilities[0].expiresAt,before.expiresAt);
+  time+=61000;await f.call(base(initial),scope);assert.equal(f.calls.at(-1).body.store,true);
+});
