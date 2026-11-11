@@ -1,6 +1,7 @@
 # Contributing / 贡献
 
 ```sh
+node scripts/prepare-host-sdk.mjs
 npm ci --ignore-scripts
 npm test
 npm pack
