@@ -177,6 +177,17 @@ for (const terminal of ['response.failed', 'response.incomplete', 'error', 'eof'
   assert.equal(f.engine.inspect().continuationHealth[0].state, 'cooling', 'full success cannot clear a continuation failure');
 });
 
+for (const loss of ['empty-eof', 'disconnect']) test(`${loss} before first output never authorizes replay`, async t => {
+  const f = await local(t, (_body, res) => {
+    if (loss === 'disconnect') res.destroy();
+    else { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(); }
+  }, { recovery: { minWaitMs: 2000, defaultWaitMs: 2000, maxWaitMs: 2000 } });
+  if (loss === 'disconnect') await assert.rejects(f.send()); else assert.equal(await (await f.send()).text(), '');
+  assert.equal(f.calls.length, 2, 'one parent and exactly one continuation');
+  assert.equal(f.engine.inspect().fallbacks, 0);
+  assert.equal(f.engine.inspect().continuationHealth[0].state, 'cooling');
+});
+
 test('a failed half-open stream renews cooldown and retains the confirmed parent', async t => {
   let clock = 1000;
   const f = await local(t, (body, res, n) => {
